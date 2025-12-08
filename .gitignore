@@ -1,0 +1,64 @@
+# --- PYTHON ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- VIRTUAL ENVIRONMENT ---
+venv/
+.venv/
+env/
+
+# --- ENVIRONMENT VARIABLES (PENTING: Jangan upload secrets) ---
+.env
+.env.*
+
+# --- IDE / EDITOR ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.project
+.settings/
+
+# --- AIRFLOW ---
+# Log yang dihasilkan Airflow saat running
+logs/
+airflow-webserver.pid
+standalone_admin_password.txt
+webserver_config.py
+
+# --- DOCKER ---
+# Folder data jika suatu saat Anda mapping volume ke lokal
+docker-data/
+postgres-data/
+minio-data/
+
+# --- DATA FILES (LOCAL TESTING) ---
+# Mencegah upload data hasil extract/transform ke repo
+*.json
+*.csv
+*.parquet
+*.avro
+
+# --- TESTING ---
+.pytest_cache/
+.coverage
+htmlcov/

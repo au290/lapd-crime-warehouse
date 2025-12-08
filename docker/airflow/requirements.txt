@@ -1,0 +1,9 @@
+apache-airflow
+pandas
+minio
+socrata-py
+pyarrow
+fsspec
+s3fs
+requests
+sodapy
