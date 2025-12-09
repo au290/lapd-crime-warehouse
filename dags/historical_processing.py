@@ -6,10 +6,8 @@ import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
-# Import fungsi
 from src.transform.fact_cleaner import clean_and_load_to_silver
 from src.transform.gold_aggregator import aggregate_crime_by_area
-# Import Validator (Biar sama dengan DAG harian)
 from governance.quality_checks.raw_validation import validate_raw_json_structure
 
 default_args = {
@@ -20,30 +18,33 @@ default_args = {
 with DAG(
     '2_manual_history_processing',
     default_args=default_args,
-    description='Pipeline Khusus: Validate -> Clean -> Aggregate (CSV Historis)',
+    description='Pipeline Khusus History',
     schedule_interval=None,
     start_date=datetime(2023, 1, 1),
     catchup=False,
-    tags=['history', 'manual', 'governance']
+    tags=['history', 'manual']
 ) as dag:
 
-    # Task 1: Validation (Satpam)
+    # Task 1: Validation
+    # Kita validasi file master history
     validate_task = PythonOperator(
         task_id='validate_historical_data',
-        python_callable=validate_raw_json_structure
+        python_callable=validate_raw_json_structure,
+        op_kwargs={'file_name': 'raw_crime_historical_master.json'} 
     )
 
-    # Task 2: Transform (Pembersih)
+    # Task 2: Transform
+    # [FIX] Kirim nama file spesifik ke cleaner
     transform_task = PythonOperator(
         task_id='process_historical_bronze',
-        python_callable=clean_and_load_to_silver
+        python_callable=clean_and_load_to_silver,
+        op_kwargs={'target_file': 'raw_crime_historical_master.json'}
     )
 
-    # Task 3: Aggregate (Gold)
+    # Task 3: Aggregate
     aggregate_task = PythonOperator(
         task_id='aggregate_history_gold',
         python_callable=aggregate_crime_by_area
     )
 
-    # Alur: Validate -> Transform -> Aggregate
     validate_task >> transform_task >> aggregate_task
