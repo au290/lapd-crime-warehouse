@@ -14,7 +14,7 @@ def aggregate_crime_by_area(**kwargs):
     
     client = Minio(MINIO_ENDPOINT, access_key=ACCESS_KEY, secret_key=SECRET_KEY, secure=False)
     
-    print("🔄 Memulai Transformasi EXTENDED STAR SCHEMA (6 Dimensi)...")
+    print("🔄 Memulai Transformasi STAR SCHEMA (Output: Parquet)...")
     
     # 2. LOAD DATA
     objects = client.list_objects(SOURCE_BUCKET, recursive=True)
@@ -45,7 +45,6 @@ def aggregate_crime_by_area(**kwargs):
     def create_dim(df, id_col, name_col):
         if id_col in df.columns and name_col in df.columns:
             dim = df[[id_col, name_col]].drop_duplicates().dropna()
-            # Hapus data dimana ID-nya 'Unknown' atau error
             dim = dim[dim[id_col] != 'Unknown']
             return dim.sort_values(id_col)
         return pd.DataFrame()
@@ -69,7 +68,6 @@ def aggregate_crime_by_area(**kwargs):
     if 'date_occ' in full_df.columns:
         min_date = full_df['date_occ'].min()
         max_date = full_df['date_occ'].max()
-        # Handle jika date range valid
         if pd.notnull(min_date) and pd.notnull(max_date):
             date_range = pd.date_range(start=min_date, end=max_date)
             dim_calendar = pd.DataFrame({
@@ -89,7 +87,6 @@ def aggregate_crime_by_area(**kwargs):
     # PEMBUATAN FACT TABLE
     # ==========================================
     
-    # Fact Table hanya menyimpan ID (Foreign Keys) dan Measures
     fact_cols = ['dr_no', 'date_occ', 'area_id', 'crm_cd', 'status_id', 'weapon_id', 'premis_id', 'vict_age', 'lat', 'lon']
     existing_cols = [c for c in fact_cols if c in full_df.columns]
     
@@ -99,27 +96,31 @@ def aggregate_crime_by_area(**kwargs):
         fact_crime['date_occ'] = pd.to_datetime(fact_crime['date_occ'])
 
     # ==========================================
-    # UPLOAD SEMUA TABEL
+    # UPLOAD SEMUA TABEL (PARQUET)
     # ==========================================
     
     if not client.bucket_exists(DEST_BUCKET): client.make_bucket(DEST_BUCKET)
 
     def upload(df, name):
+        # [CHANGE] Ubah nama file jadi .parquet
+        filename = f"{name}.parquet"
         buf = BytesIO()
-        df.to_csv(buf, index=False)
+        # [CHANGE] Gunakan to_parquet
+        df.to_parquet(buf, index=False, engine='pyarrow')
         buf.seek(0)
-        client.put_object(DEST_BUCKET, name, buf, length=buf.getbuffer().nbytes, content_type="text/csv")
-        print(f"🚀 {name}: {len(df)} rows")
+        # [CHANGE] Content type binary
+        client.put_object(DEST_BUCKET, filename, buf, length=buf.getbuffer().nbytes, content_type="application/octet-stream")
+        print(f"🚀 {filename}: {len(df)} rows")
 
-    upload(dim_area, "dim_area.csv")
-    upload(dim_crime, "dim_crime.csv")
-    upload(dim_status, "dim_status.csv")
-    upload(dim_weapon, "dim_weapon.csv")
-    upload(dim_premis, "dim_premis.csv")
-    upload(dim_calendar, "dim_calendar.csv")
-    upload(fact_crime, "fact_crime.csv")
+    upload(dim_area, "dim_area")
+    upload(dim_crime, "dim_crime")
+    upload(dim_status, "dim_status")
+    upload(dim_weapon, "dim_weapon")
+    upload(dim_premis, "dim_premis")
+    upload(dim_calendar, "dim_calendar")
+    upload(fact_crime, "fact_crime")
     
-    print("🏁 6-Dimension Star Schema Completed!")
+    print("🏁 Star Schema (Parquet Format) Completed!")
 
 if __name__ == "__main__":
     aggregate_crime_by_area()
