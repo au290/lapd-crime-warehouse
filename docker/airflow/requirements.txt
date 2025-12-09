@@ -11,3 +11,5 @@ streamlit
 plotly
 duckdb
 pydeck
+prophet
+joblib
