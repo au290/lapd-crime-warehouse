@@ -25,52 +25,56 @@ def clean_and_load_to_silver(**kwargs):
         response.close()
         response.release_conn()
     except Exception as e:
-        print(f"Gagal membaca file atau file tidak ditemukan: {e}")
-        return
+        print(f"Gagal membaca file: {e}")
+        # Raise error agar Airflow tahu task ini gagal jika file tidak ada
+        raise e 
 
     # 3. Transformasi dengan Pandas
     df = pd.DataFrame(data)
     print(f"Data mentah dimuat: {len(df)} baris.")
-
-    # --- CLEANING RULES (VERSI ROBUST) ---
     
-    # A. Tanggal: Pastikan format datetime
-    date_cols = ['date_occ', 'date_rptd']
-    for col in date_cols:
-        if col in df.columns:
+    # =========================================================
+    # [BAGIAN PENTING: STANDARDISASI KOLOM]
+    # Mengatasi perbedaan header CSV ("AREA NAME") vs API ("area_name")
+    # 1. Ubah semua jadi huruf kecil (lower)
+    # 2. Ganti spasi dengan garis bawah (replace)
+    # =========================================================
+    df.columns = df.columns.str.lower().str.replace(' ', '_')
+    print("Header kolom setelah standarisasi:", df.columns.tolist())
+
+    # --- CLEANING RULES ---
+    
+    # A. Tanggal (Cek nama kolom yang sudah distandarisasi)
+    # Kita gunakan loop untuk mencari kolom yang mengandung kata 'date'
+    for col in df.columns:
+        if 'date' in col:
             df[col] = pd.to_datetime(df[col], errors='coerce')
     
-    # B. Numerik: Paksa jadi angka, yang error jadi NaN
+    # B. Numerik
     numeric_cols = ['lat', 'lon', 'vict_age', 'dr_no']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # C. [PENTING - FIX ERROR PARQUET] 
-    # Paksa semua kolom sisa (Object) menjadi STRING murni.
-    # Ini mencegah error "ArrowInvalid" karena tipe data campuran.
+    # C. Konversi sisa Object ke String (Agar Parquet tidak error)
+    # Ini mencegah error ArrowInvalid pada tipe data campuran
     for col in df.columns:
-        if col not in date_cols and col not in numeric_cols:
+        if df[col].dtype == 'object':
             df[col] = df[col].astype(str)
 
-    print("Data berhasil dibersihkan dan distandarisasi.")
+    print("Data berhasil dibersihkan.")
 
     # 4. Simpan ke Silver (Format Parquet)
     parquet_buffer = BytesIO()
     try:
-        # Engine pyarrow wajib terinstall
         df.to_parquet(parquet_buffer, index=False, engine='pyarrow')
     except Exception as e:
-        print(f"CRITICAL ERROR saat convert Parquet: {e}")
-        # Print tipe data untuk debugging jika masih gagal
-        print(df.dtypes)
+        print(f"Error convert Parquet: {e}")
         raise e
 
     parquet_buffer.seek(0)
-    
     dest_filename = f"clean_crime_{today_str}.parquet"
     
-    # Cek bucket silver, buat jika belum ada
     if not client.bucket_exists(DEST_BUCKET):
         client.make_bucket(DEST_BUCKET)
 
