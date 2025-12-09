@@ -9,10 +9,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from src.transform.fact_cleaner import clean_and_load_to_silver
 from src.transform.gold_aggregator import aggregate_crime_by_area
 from governance.quality_checks.raw_validation import validate_raw_json_structure
+# [BARU] Import Callback
+from src.utils.callbacks import send_failure_alert, send_success_alert
 
 default_args = {
     'owner': 'data-engineer',
     'depends_on_past': False,
+    # [BARU] Pasang Callback Lengkap
+    'on_failure_callback': send_failure_alert,
+    'on_success_callback': send_success_alert
 }
 
 with DAG(
@@ -26,7 +31,6 @@ with DAG(
 ) as dag:
 
     # Task 1: Validation
-    # Kita validasi file master history
     validate_task = PythonOperator(
         task_id='validate_historical_data',
         python_callable=validate_raw_json_structure,
@@ -34,7 +38,6 @@ with DAG(
     )
 
     # Task 2: Transform
-    # [FIX] Kirim nama file spesifik ke cleaner
     transform_task = PythonOperator(
         task_id='process_historical_bronze',
         python_callable=clean_and_load_to_silver,

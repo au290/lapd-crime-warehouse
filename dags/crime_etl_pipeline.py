@@ -6,17 +6,21 @@ import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
-# Import modul-modul kita
+# Import fungsi
 from src.extract.lacity_api import fetch_and_upload_crime_data
 from src.transform.fact_cleaner import clean_and_load_to_silver
 from src.transform.gold_aggregator import aggregate_crime_by_area
-# Import Validator Baru
 from governance.quality_checks.raw_validation import validate_raw_json_structure
+# [BARU] Import Callback
+from src.utils.callbacks import send_failure_alert, send_success_alert
 
 default_args = {
     'owner': 'data-engineer',
     'depends_on_past': False,
-    'retries': 0, # Jangan retry jika validasi gagal (percuma)
+    'retries': 0,
+    # [BARU] Pasang Callback Gagal (Tag User) & Sukses (Info Biasa)
+    'on_failure_callback': send_failure_alert,
+    'on_success_callback': send_success_alert
 }
 
 with DAG(
@@ -29,29 +33,28 @@ with DAG(
     tags=['lapd', 'governance']
 ) as dag:
 
-    # 1. EXTRACT
+    # Task 1: Extract
     ingest_task = PythonOperator(
         task_id='1_extract_api_bronze',
         python_callable=fetch_and_upload_crime_data
     )
 
-    # 2. VALIDATE (Satpam) - Akan gagal di sini jika data sampah
+    # Task 2: Validate
     validate_task = PythonOperator(
         task_id='2_validate_raw_quality',
         python_callable=validate_raw_json_structure
     )
 
-    # 3. TRANSFORM (Pembersih + Schema Enforcer)
+    # Task 3: Transform
     transform_task = PythonOperator(
         task_id='3_transform_silver_governance',
         python_callable=clean_and_load_to_silver
     )
 
-    # 4. AGGREGATE (Warehouse)
+    # Task 4: Aggregate
     aggregate_task = PythonOperator(
         task_id='4_load_gold_warehouse',
         python_callable=aggregate_crime_by_area
     )
 
-    # Alur Eksekusi
     ingest_task >> validate_task >> transform_task >> aggregate_task
