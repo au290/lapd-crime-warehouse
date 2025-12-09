@@ -1,21 +1,24 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import duckdb
 import pydeck as pdk
+import duckdb
 
-# --- KONFIGURASI HALAMAN ---
+# --- 1. KONFIGURASI HALAMAN ---
 st.set_page_config(
-    page_title="LAPD Crime Intel", 
-    layout="wide", 
+    page_title="LAPD Crime Intelligence",
     page_icon="🚔",
+    layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- INIT DUCKDB & MINIO ---
+# --- 2. ENGINE KONEKSI (DuckDB + MinIO) ---
 @st.cache_resource
 def get_db_connection():
+    # In-memory OLAP database
     con = duckdb.connect(database=':memory:')
+    
+    # Setup koneksi S3 ke MinIO
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("""
         SET s3_endpoint='minio:9000';
@@ -26,193 +29,237 @@ def get_db_connection():
     """)
     return con
 
-# --- LOAD METADATA ---
-def get_filter_options(con):
+# --- 3. DATA LOADER (Metadata untuk Filter) ---
+def load_filter_options(con):
     try:
-        # Ambil range tanggal
-        dates = con.execute("""
-            SELECT min(date_occ), max(date_occ) 
-            FROM read_parquet('s3://crime-gold/fact_crime.parquet')
-        """).fetchone()
+        # Ambil range tanggal dari Fact Table (scan metadata saja, cepat)
+        dates = con.execute("SELECT min(date_occ), max(date_occ) FROM read_parquet('s3://crime-gold/fact_crime.parquet')").fetchone()
         
-        # Ambil list area
-        areas = con.execute("""
-            SELECT DISTINCT area_name 
-            FROM read_parquet('s3://crime-gold/dim_area.parquet') 
-            ORDER BY 1
-        """).df()
+        # Ambil daftar Area
+        areas = con.execute("SELECT DISTINCT area_name FROM read_parquet('s3://crime-gold/dim_area.parquet') ORDER BY 1").df()
         
-        # Ambil list kategori kejahatan
-        crimes = con.execute("""
-            SELECT DISTINCT crm_cd_desc 
-            FROM read_parquet('s3://crime-gold/dim_crime.parquet') 
-            ORDER BY 1
-        """).df()
+        # Ambil daftar Kejahatan
+        crimes = con.execute("SELECT DISTINCT crm_cd_desc FROM read_parquet('s3://crime-gold/dim_crime.parquet') ORDER BY 1").df()
         
         return dates, areas['area_name'].tolist(), crimes['crm_cd_desc'].tolist()
-    except Exception:
+    except Exception as e:
         return None, [], []
 
-# --- QUERY OLAP ---
-def query_data(con, start_date, end_date, selected_areas, selected_crimes):
-    if not selected_areas:
-        area_filter = "1=1"
-    else:
+# --- 4. DATA ENGINE (Query Utama) ---
+def query_analytical_data(con, start_date, end_date, selected_areas, selected_crimes):
+    # Dynamic SQL Building
+    where_clauses = [f"f.date_occ BETWEEN '{start_date}' AND '{end_date}'"]
+    
+    if selected_areas:
         areas_str = "', '".join(selected_areas)
-        area_filter = f"da.area_name IN ('{areas_str}')"
-
-    if not selected_crimes:
-        crime_filter = "1=1"
-    else:
+        where_clauses.append(f"da.area_name IN ('{areas_str}')")
+        
+    if selected_crimes:
+        # Escape single quotes untuk keamanan SQL sederhana
         safe_crimes = [c.replace("'", "''") for c in selected_crimes]
         crimes_str = "', '".join(safe_crimes)
-        crime_filter = f"dc.crm_cd_desc IN ('{crimes_str}')"
+        where_clauses.append(f"dc.crm_cd_desc IN ('{crimes_str}')")
 
-    # Query dioptimalkan untuk PyDeck (Butuh lat, lon, dan info warna)
-    query = f"""
+    where_stmt = " AND ".join(where_clauses)
+
+    # Query Utama: Join Fact + Dimensions
+    # Limit 50k untuk visualisasi peta agar browser tidak crash/berat
+    sql = f"""
         SELECT 
-            f.dr_no, 
-            f.date_occ, 
-            da.area_name, 
-            dc.crm_cd_desc, 
-            ds.status_desc, 
+            f.date_occ,
+            da.area_name,
+            dc.crm_cd_desc,
             dw.weapon_desc,
-            dp.premis_desc,
-            f.vict_age, 
-            f.lat, 
+            ds.status_desc,
+            f.vict_age,
+            f.lat,
             f.lon
         FROM read_parquet('s3://crime-gold/fact_crime.parquet') f
         LEFT JOIN read_parquet('s3://crime-gold/dim_area.parquet') da ON f.area_id = da.area_id
         LEFT JOIN read_parquet('s3://crime-gold/dim_crime.parquet') dc ON f.crm_cd = dc.crm_cd
         LEFT JOIN read_parquet('s3://crime-gold/dim_status.parquet') ds ON f.status_id = ds.status_id
         LEFT JOIN read_parquet('s3://crime-gold/dim_weapon.parquet') dw ON f.weapon_id = dw.weapon_id
-        LEFT JOIN read_parquet('s3://crime-gold/dim_premis.parquet') dp ON f.premis_id = dp.premis_id
-        WHERE f.date_occ BETWEEN '{start_date}' AND '{end_date}'
-          AND {area_filter}
-          AND {crime_filter}
-          AND f.lat != 0 AND f.lon != 0
+        WHERE {where_stmt}
+        AND f.lat != 0 AND f.lon != 0 
+        LIMIT 50000
     """
-    return con.execute(query).df()
-
-# --- MAIN APP ---
-def main():
-    st.title("🚔 LAPD Crime Intelligence (WebGL Accelerated)")
     
+    return con.execute(sql).df()
+
+def query_kpi_stats(con, start_date, end_date):
+    # Query terpisah untuk KPI total (tanpa limit) agar akurat
+    sql = f"""
+        SELECT count(*) as total_cases, avg(vict_age) as avg_age
+        FROM read_parquet('s3://crime-gold/fact_crime.parquet')
+        WHERE date_occ BETWEEN '{start_date}' AND '{end_date}'
+    """
+    return con.execute(sql).df()
+
+# --- 5. UI UTAMA ---
+def main():
     con = get_db_connection()
     
     # --- SIDEBAR ---
-    st.sidebar.header("🔍 Filter Dashboard")
-    dates, area_opts, crime_opts = get_filter_options(con)
+    st.sidebar.title("🔍 Filter Dashboard")
+    
+    # Load Metadata
+    dates, area_opts, crime_opts = load_filter_options(con)
     
     if not dates or not dates[0]:
-        st.error("Data Warehouse tidak merespons. Cek MinIO.")
+        st.error("Gagal terhubung ke Data Warehouse. Pastikan MinIO & ETL berjalan.")
         st.stop()
 
     min_d, max_d = dates
+    
+    # Input Filters
     s_date, e_date = st.sidebar.date_input("Rentang Waktu", [min_d, max_d])
-    sel_areas = st.sidebar.multiselect("Pilih Wilayah", area_opts)
+    sel_areas = st.sidebar.multiselect("Wilayah (Area)", area_opts)
     sel_crimes = st.sidebar.multiselect("Jenis Kejahatan", crime_opts)
+    
+    st.sidebar.markdown("---")
+    st.sidebar.info("💡 **Tips:** Heatmap menunjukkan konsentrasi kejadian. Zoom in untuk melihat detail jalan.")
 
-    with st.spinner("Processing massive dataset..."):
-        df = query_data(con, s_date, e_date, sel_areas, sel_crimes)
+    # --- BODY ---
+    st.title("🚔 LAPD Crime Intelligence")
+    st.caption(f"Data Analisis Periode: {s_date} s/d {e_date}")
+
+    # Load Data
+    with st.spinner("Memproses data analitik..."):
+        df = query_analytical_data(con, s_date, e_date, sel_areas, sel_crimes)
+        kpi_df = query_kpi_stats(con, s_date, e_date)
+
+    if df.empty:
+        st.warning("Tidak ada data yang cocok dengan filter.")
+        return
 
     # --- KPI ROW ---
-    st.markdown("### 📊 Ringkasan Eksekutif")
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Kasus", f"{len(df):,}")
+    col1, col2, col3, col4 = st.columns(4)
     
-    top_c = df['crm_cd_desc'].mode()[0] if not df.empty else "-"
-    k2.metric("Kejahatan #1", top_c[:15] + "..." if len(top_c)>15 else top_c)
+    total_cases = kpi_df['total_cases'][0]
+    col1.metric("Total Kasus", f"{total_cases:,}", delta_color="off")
     
-    top_w = df['weapon_desc'].mode()[0] if not df.empty else "-"
-    k3.metric("Senjata #1", top_w[:15] + "..." if len(top_w)>15 else top_w)
+    top_crime = df['crm_cd_desc'].mode()[0] if not df.empty else "-"
+    col2.metric("Kejahatan #1", top_crime[:15] + "..." if len(top_crime)>15 else top_crime)
     
-    avg_age = round(df['vict_age'].mean()) if not df.empty else 0
-    k4.metric("Avg Umur", f"{avg_age} Thn")
+    top_area = df['area_name'].mode()[0] if not df.empty else "-"
+    col3.metric("Area Rawan", top_area)
     
-    st.divider()
+    avg_age = round(kpi_df['avg_age'][0] or 0)
+    col4.metric("Avg Umur Korban", f"{avg_age} Thn")
 
-    # --- PETA PYDECK (SOLUSI OOM) ---
-    st.subheader("🗺️ Peta Geospasial Interaktif")
-    
-    c_map1, c_map2 = st.columns([1, 4])
-    with c_map1:
-        map_style = st.radio("Mode Visualisasi:", ["3D Hexagon (Agregat)", "Scatter (Titik)"])
-        st.info("💡 **Hexagon** lebih ringan untuk data besar. **Scatter** untuk melihat detail lokasi.")
+    st.markdown("---")
 
-    with c_map2:
-        if df.empty:
-            st.warning("Data kosong.")
-        else:
-            # 1. Tentukan View State (Posisi Awal Kamera)
-            view_state = pdk.ViewState(
-                latitude=34.05,
-                longitude=-118.24,
-                zoom=9,
-                pitch=45 if map_style == "3D Hexagon (Agregat)" else 0, # Miringkan kamera kalau 3D
-            )
+    # --- TABS LAYOUT ---
+    tab1, tab2, tab3 = st.tabs(["🗺️ Peta Panas (Heatmap)", "📈 Grafik & Tren", "📋 Data Mentah"])
 
-            # 2. Tentukan Layer
-            layers = []
-            
-            if map_style == "3D Hexagon (Agregat)":
-                # Layer Hexagon (Sangat Efisien & Profesional)
-                layer = pdk.Layer(
-                    "HexagonLayer",
-                    data=df,
-                    get_position=["lon", "lat"],
-                    radius=200, # Ukuran hexagon (meter)
-                    elevation_scale=50,
-                    elevation_range=[0, 1000],
-                    pickable=True,
-                    extruded=True, # Biar jadi 3D
-                )
-                layers.append(layer)
-                tooltip = {"html": "<b>Jumlah Kasus:</b> {elevationValue}"}
+    # TAB 1: PETA PYDECK (HEATMAP)
+    with tab1:
+        st.subheader("Peta Konsentrasi Kriminalitas")
+        
+        # Palet Warna Heatmap (Biru -> Kuning -> Merah)
+        COLOR_RANGE = [
+            [65, 182, 196],
+            [127, 205, 187],
+            [199, 233, 180],
+            [237, 248, 177],
+            [254, 224, 139],
+            [253, 174, 97],
+            [244, 109, 67],
+            [215, 48, 39]
+        ]
+
+        # Layer 1: Heatmap (Utama)
+        layer_heatmap = pdk.Layer(
+            "HeatmapLayer",
+            data=df,
+            get_position=["lon", "lat"],
+            opacity=0.8,
+            radiusPixels=40,  # Ukuran pendaran (semakin besar semakin menyatu)
+            colorRange=COLOR_RANGE,
+            threshold=0.05,
+            pickable=True,
+        )
+        
+        # Layer 2: Scatter (Titik Detail - Opsional)
+        layer_scatter = pdk.Layer(
+            "ScatterplotLayer",
+            data=df,
+            get_position=["lon", "lat"],
+            get_color="[255, 255, 255, 150]", # Putih transparan
+            get_radius=30,
+            pickable=True,
+        )
+
+        # View State (Kamera Tegak Lurus / 2D)
+        view_state = pdk.ViewState(
+            latitude=34.05,
+            longitude=-118.24,
+            zoom=9.5,
+            pitch=0,  # 0 Derajat = Datar (seperti peta biasa)
+            bearing=0
+        )
+
+        # Tooltip
+        tooltip = {
+            "html": "<b>Area:</b> {area_name}<br/><b>Kejahatan:</b> {crm_cd_desc}<br/><b>Koordinat:</b> {lat}, {lon}"
+        }
+
+        # Render Deck
+        # map_style='dark' akan otomatis memuat basemap Carto Dark (Gratis)
+        r = pdk.Deck(
+            layers=[layer_heatmap], # Default cuma heatmap
+            initial_view_state=view_state,
+            map_style="light", 
+            tooltip=tooltip
+        )
+        
+        # Kontrol Overlay
+        c_map_main, c_map_ctrl = st.columns([3, 1])
+        
+        with c_map_ctrl:
+            st.markdown("#### Kontrol Peta")
+            show_points = st.checkbox("Tampilkan Titik Kasus", value=False, help="Menampilkan titik putih di pusat kejadian")
+            if show_points:
+                r.layers.append(layer_scatter)
                 
-            else:
-                # Layer Scatter (Titik Biasa tapi pakai GPU)
-                # Jauh lebih kuat daripada Plotly
-                layer = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=df,
-                    get_position=["lon", "lat"],
-                    get_color="[200, 30, 0, 160]", # Merah transparan
-                    get_radius=100,
-                    pickable=True,
-                )
-                layers.append(layer)
-                tooltip = {
-                    "html": "<b>Kejahatan:</b> {crm_cd_desc}<br/><b>Area:</b> {area_name}<br/><b>Senjata:</b> {weapon_desc}"
-                }
+        with c_map_main:
+            st.pydeck_chart(r)
 
-            # 3. Render Peta
-            st.pydeck_chart(pdk.Deck(
-                map_style="mapbox://styles/mapbox/dark-v10", # Dark mode
-                initial_view_state=view_state,
-                layers=layers,
-                tooltip=tooltip
-            ))
-
-    # --- CHARTS ROW ---
-    st.divider()
-    c_chart1, c_chart2 = st.columns(2)
-    
-    with c_chart1:
-        st.subheader("📈 Tren Harian")
-        if not df.empty:
-            daily = df.groupby('date_occ').size().reset_index(name='Jumlah')
-            fig = px.line(daily, x='date_occ', y='Jumlah', template="plotly_white")
-            st.plotly_chart(fig, use_container_width=True)
+    # TAB 2: GRAFIK
+    with tab2:
+        c_chart1, c_chart2 = st.columns(2)
+        
+        with c_chart1:
+            st.subheader("Tren Harian")
+            if not df.empty:
+                daily = df.groupby('date_occ').size().reset_index(name='Jumlah')
+                fig_line = px.area(daily, x='date_occ', y='Jumlah', template="plotly_dark")
+                fig_line.update_layout(height=350)
+                st.plotly_chart(fig_line, use_container_width=True)
             
-    with c_chart2:
-        st.subheader("⚠️ Top 10 Kejahatan")
-        if not df.empty:
-            top_crimes = df['crm_cd_desc'].value_counts().head(10).reset_index()
-            top_crimes.columns = ['Kejahatan', 'Jumlah']
-            fig = px.bar(top_crimes, x='Jumlah', y='Kejahatan', orientation='h', color='Jumlah', color_continuous_scale='Reds')
-            fig.update_layout(yaxis={'categoryorder':'total ascending'}, template="plotly_white")
-            st.plotly_chart(fig, use_container_width=True)
+        with c_chart2:
+            st.subheader("Proporsi Status Kasus")
+            if not df.empty:
+                status_cnt = df['status_desc'].value_counts().reset_index()
+                status_cnt.columns = ['Status', 'Jumlah']
+                fig_pie = px.pie(status_cnt, values='Jumlah', names='Status', hole=0.5, template="plotly_dark")
+                fig_pie.update_layout(showlegend=False, height=350)
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+        st.subheader("Analisis Senjata vs Kejahatan")
+        if 'weapon_desc' in df.columns and not df.empty:
+            matriks = pd.crosstab(df['crm_cd_desc'], df['weapon_desc'])
+            # Top 10 interaction
+            top_crime_idx = matriks.sum(axis=1).sort_values(ascending=False).head(10).index
+            top_weapon_idx = matriks.sum(axis=0).sort_values(ascending=False).head(10).index
+            matriks_filtered = matriks.loc[top_crime_idx, top_weapon_idx]
+            
+            fig_heat = px.imshow(matriks_filtered, text_auto=True, aspect="auto", color_continuous_scale="Viridis", template="plotly_dark")
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+    # TAB 3: DATA MENTAH
+    with tab3:
+        st.dataframe(df.sort_values(by='date_occ', ascending=False), use_container_width=True)
 
 if __name__ == "__main__":
     main()
