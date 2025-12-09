@@ -73,21 +73,22 @@ services:
     command: /create_buckets.sh
 
 # --- DASHBOARD (STREAMLIT) ---
+  # --- DASHBOARD (STREAMLIT) ---
   dashboard:
     build:
       context: ./docker/airflow
       dockerfile: Dockerfile
-    # [FIX] Paksa container menggunakan Bash, bukan Airflow Entrypoint
+    # [FIX] Paksa container menggunakan Bash
     entrypoint: /bin/bash
-    # [FIX] Jalankan perintah Streamlit lewat bash
-    command: -c "streamlit run /opt/airflow/src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0"
+    # [FIX] Tambahkan --server.maxMessageSize 1000 agar bisa kirim data besar
+    command: -c "streamlit run /opt/airflow/src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.maxMessageSize 1000"
     ports:
       - "8501:8501"
     volumes:
       - ./src:/opt/airflow/src
     depends_on:
       - minio
-
+      
   # --- AIRFLOW SERVICES ---
   airflow-webserver:
     <<: *airflow-common
