@@ -22,7 +22,6 @@ def load_schema_contract():
         return json.load(f)
 
 def clean_and_load_to_silver(**kwargs):
-    # [FIX] Tangkap parameter nama file dari Airflow (jika ada)
     target_filename = kwargs.get('target_file')
 
     # 1. Konfigurasi
@@ -34,13 +33,11 @@ def clean_and_load_to_silver(**kwargs):
     
     client = Minio(MINIO_ENDPOINT, access_key=ACCESS_KEY, secret_key=SECRET_KEY, secure=False)
     
-    # 2. Tentukan File Input & Output
+    # 2. Tentukan File
     if target_filename:
-        # Mode Manual/History
         source_file = target_filename
         output_file = target_filename.replace('raw_', 'clean_').replace('.json', '.parquet')
     else:
-        # Mode Harian (Default)
         today_str = datetime.now().strftime("%Y-%m-%d")
         source_file = f"raw_crime_{today_str}.json"
         output_file = f"clean_crime_{today_str}.parquet"
@@ -61,16 +58,20 @@ def clean_and_load_to_silver(**kwargs):
     # --- GOVERNANCE SCHEMA ---
     contract = load_schema_contract()
     if contract:
+        # A. Rename Kolom Wajib (Sesuai Kontrak)
         if "column_mapping" in contract:
              df.rename(columns=contract["column_mapping"], inplace=True)
              upper_mapping = {k.upper(): v for k, v in contract["column_mapping"].items()}
              df.rename(columns=upper_mapping, inplace=True)
         
+        # B. Validasi Kolom Wajib
         missing_cols = [c for c in contract["required_columns"] if c not in df.columns]
         if missing_cols:
             raise ValueError(f"⛔ DATA DITOLAK! Kolom hilang: {missing_cols}")
-    else:
-        df.columns = df.columns.str.lower().str.replace(' ', '_')
+    
+    # [FIX UTAMA] Normalisasi SEMUA kolom sisa menjadi snake_case
+    # Ini mengubah 'Crm Cd Desc' menjadi 'crm_cd_desc' agar terbaca Dashboard
+    df.columns = df.columns.str.lower().str.replace(' ', '_')
 
     # --- CLEANING TIPE DATA ---
     for col in df.columns:

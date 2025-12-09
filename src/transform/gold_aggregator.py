@@ -14,7 +14,7 @@ def aggregate_crime_by_area(**kwargs):
     
     client = Minio(MINIO_ENDPOINT, access_key=ACCESS_KEY, secret_key=SECRET_KEY, secure=False)
     
-    print("🔄 Memulai Aggregasi Full Refresh...")
+    print("🔄 Memulai Proses Gold Layer (Fact Table Generation)...")
     
     # 2. SCAN SEMUA FILE SILVER
     objects = client.list_objects(SOURCE_BUCKET, recursive=True)
@@ -35,36 +35,44 @@ def aggregate_crime_by_area(**kwargs):
         print("❌ Tidak ada data.")
         return
 
-    # 3. GABUNG & DEDUPLIKASI
+    # 3. GABUNG DATA
     full_df = pd.concat(all_dfs, ignore_index=True)
-    print(f"📦 Total Raw: {len(full_df)}")
+    print(f"📦 Total Raw Data: {len(full_df)}")
 
-    # [FIX] Hapus duplikat berdasarkan ID Kasus (dr_no)
+    # 4. DEDUPLIKASI (PENTING!)
     if 'dr_no' in full_df.columns:
         full_df = full_df.drop_duplicates(subset=['dr_no'], keep='last')
-        print(f"✨ Total Bersih (Unik): {len(full_df)}")
+        print(f"✨ Total Unik: {len(full_df)}")
 
-    # 4. AGREGASI
-    if 'area_name' in full_df.columns:
-        agg_df = full_df.groupby('area_name').size().reset_index(name='total_crimes')
-        agg_df = agg_df.sort_values(by='total_crimes', ascending=False)
-    else:
-        print("❌ Kolom area_name hilang.")
-        return
+    # 5. DATA CLEANUP UNTUK DASHBOARD
+    # Filter data yang koordinatnya 0 (Null Island) agar peta tidak rusak
+    if 'lat' in full_df.columns and 'lon' in full_df.columns:
+        full_df = full_df[(full_df['lat'] != 0) & (full_df['lon'] != 0)]
+    
+    # Pastikan tanggal formatnya benar
+    if 'date_occ' in full_df.columns:
+        full_df['date_occ'] = pd.to_datetime(full_df['date_occ'])
 
-    # 5. SIMPAN MASTER FILE
-    # Gunakan satu nama file master
-    dest_filename = "master_crime_summary.csv"
+    # 6. SIMPAN MASTER FACT TABLE (CSV)
+    # Kita simpan CSV lengkap agar Dashboard bisa melakukan filtering bebas
+    dest_filename = "master_crime_fact_table.csv"
     
     csv_buffer = BytesIO()
-    agg_df.to_csv(csv_buffer, index=False)
+    full_df.to_csv(csv_buffer, index=False)
     csv_buffer.seek(0)
     
     if not client.bucket_exists(DEST_BUCKET):
         client.make_bucket(DEST_BUCKET)
 
-    client.put_object(DEST_BUCKET, dest_filename, csv_buffer, length=csv_buffer.getbuffer().nbytes, content_type="text/csv")
-    print("✅ Gold Layer Updated!")
+    print(f"🚀 Menyimpan Fact Table ke {dest_filename}...")
+    client.put_object(
+        DEST_BUCKET,
+        dest_filename,
+        csv_buffer,
+        length=csv_buffer.getbuffer().nbytes,
+        content_type="text/csv"
+    )
+    print("✅ Gold Layer Selesai!")
 
 if __name__ == "__main__":
     aggregate_crime_by_area()
