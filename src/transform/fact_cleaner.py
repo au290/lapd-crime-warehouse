@@ -58,31 +58,48 @@ def clean_and_load_to_silver(**kwargs):
     # --- GOVERNANCE SCHEMA ---
     contract = load_schema_contract()
     if contract:
-        # A. Rename Kolom Wajib (Sesuai Kontrak)
+        # Rename Kolom Wajib (Sesuai Kontrak)
         if "column_mapping" in contract:
              df.rename(columns=contract["column_mapping"], inplace=True)
              upper_mapping = {k.upper(): v for k, v in contract["column_mapping"].items()}
              df.rename(columns=upper_mapping, inplace=True)
         
-        # B. Validasi Kolom Wajib
+        # Validasi Kolom Wajib
         missing_cols = [c for c in contract["required_columns"] if c not in df.columns]
         if missing_cols:
             raise ValueError(f"⛔ DATA DITOLAK! Kolom hilang: {missing_cols}")
     
-    # [FIX UTAMA] Normalisasi SEMUA kolom sisa menjadi snake_case
-    # Ini mengubah 'Crm Cd Desc' menjadi 'crm_cd_desc' agar terbaca Dashboard
+    # Normalisasi SEMUA kolom sisa menjadi snake_case
     df.columns = df.columns.str.lower().str.replace(' ', '_')
 
     # --- CLEANING TIPE DATA ---
+    
+    # A. Tanggal
     for col in df.columns:
         if 'date' in col:
             df[col] = pd.to_datetime(df[col], errors='coerce')
     
-    numeric_cols = ['lat', 'lon', 'vict_age', 'dr_no']
+    # B. Numerik Murni (Hanya Lat, Lon, Umur)
+    # Jangan masukkan ID di sini karena ID bisa alphanumeric
+    numeric_cols = ['lat', 'lon', 'vict_age']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
+    # C. [FIX] ID & Codes (Dimensi Keys) - Handle Alphanumeric
+    # Strategi Baru: 
+    # 1. Isi NaN dengan 'Unknown'
+    # 2. Ubah semua ke String
+    # 3. Hapus akhiran ".0" manual dengan regex (utk kasus ID angka seperti 100.0)
+    # Ini aman untuk 'IC', 'AA', maupun '100.0'
+    id_cols = ['dr_no', 'area_id', 'crm_cd', 'status_id', 'weapon_id', 'premis_id']
+    for col in id_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna('Unknown').astype(str).str.replace(r'\.0$', '', regex=True)
+            # Pastikan 'nan' string juga dianggap Unknown
+            df[col] = df[col].replace('nan', 'Unknown')
+
+    # D. String Deskripsi (Sisa)
     for col in df.columns:
         if df[col].dtype == 'object':
             df[col] = df[col].astype(str)

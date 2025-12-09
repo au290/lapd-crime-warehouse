@@ -3,174 +3,202 @@ import pandas as pd
 import plotly.express as px
 from minio import Minio
 from io import BytesIO
+import gc
 
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(
-    page_title="LAPD Crime Analytics",
-    page_icon="🚔",
-    layout="wide",
+    page_title="LAPD Enterprise DW (Optimized)", 
+    layout="wide", 
+    page_icon="⚡",
     initial_sidebar_state="expanded"
 )
 
-# --- FUNGSI LOAD DATA ---
-@st.cache_data(ttl=300)
-def load_data():
-    client = Minio(
+# --- FUNGSI KONEKSI MINIO ---
+@st.cache_resource
+def get_minio_client():
+    return Minio(
         "minio:9000",
         access_key="minioadmin",
         secret_key="minioadmin",
         secure=False
     )
-    bucket = "crime-gold"
-    filename = "master_crime_fact_table.csv"
-    
+
+# --- FUNGSI LOAD DATA (OPTIMIZED) ---
+@st.cache_data(ttl=600) # Cache 10 menit
+def load_dim_table(filename):
+    """Load tabel dimensi kecil dengan optimasi tipe data"""
+    client = get_minio_client()
     try:
-        response = client.get_object(bucket, filename)
-        df = pd.read_csv(BytesIO(response.read()))
+        response = client.get_object("crime-gold", filename)
+        # Baca sebagai string untuk ID agar aman, sisanya biarkan otomatis
+        df = pd.read_csv(BytesIO(response.read()), dtype=str)
+        response.close()
+        response.release_conn()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=600)
+def load_fact_table():
+    """Load Fact Table (Tabel Terbesar) dengan strategi hemat memori"""
+    client = get_minio_client()
+    try:
+        response = client.get_object("crime-gold", "fact_crime.csv")
+        # Optimasi: Hanya load kolom yang perlu ditampilkan/difilter jika file sangat besar
+        # Tapi untuk sekarang kita load semua dengan spesifikasi tipe data
+        dtypes = {
+            'dr_no': 'str',
+            'area_id': 'str',
+            'crm_cd': 'str', 
+            'status_id': 'str',
+            'weapon_id': 'str', 
+            'premis_id': 'str',
+            'vict_age': 'float32', # Hemat memori dibanding float64
+            'lat': 'float32',
+            'lon': 'float32'
+        }
+        df = pd.read_csv(BytesIO(response.read()), dtype=dtypes)
         response.close()
         response.release_conn()
         
-        # [FIX 1] Konversi Tanggal
+        # Konversi tanggal (Wajib)
         if 'date_occ' in df.columns:
             df['date_occ'] = pd.to_datetime(df['date_occ'])
             
-        # [FIX 2] Handle Error Sorting (Str vs Float)
-        # Isi data kosong di area_name dengan 'Unknown' lalu paksa jadi String
-        if 'area_name' in df.columns:
-            df['area_name'] = df['area_name'].fillna('Unknown').astype(str)
-            
         return df
     except Exception as e:
-        # Print error ke terminal container untuk debugging
-        print(f"Error loading data: {e}")
+        print(f"Error loading fact: {e}")
         return pd.DataFrame()
+
+# --- FUNGSI JOIN DINAMIS (ON-THE-FLY) ---
+def join_with_dims(fact_df, dims_dict):
+    """Hanya melakukan join pada data yang SUDAH difilter (baris sedikit)"""
+    merged = fact_df.copy()
+    
+    # Mapping nama file dimensi ke kolom key
+    join_map = [
+        ("dim_area", "area_id"),
+        ("dim_crime", "crm_cd"),
+        ("dim_status", "status_id"),
+        ("dim_weapon", "weapon_id"),
+        ("dim_premis", "premis_id")
+    ]
+    
+    for dim_name, key in join_map:
+        if dim_name in dims_dict and not dims_dict[dim_name].empty:
+            dim_df = dims_dict[dim_name]
+            if key in merged.columns and key in dim_df.columns:
+                merged = pd.merge(merged, dim_df, on=key, how="left")
+    
+    return merged
 
 # --- MAIN APP ---
 def main():
-    # 1. Load Data
-    df = load_data()
+    st.title("⚡ LAPD Crime Dashboard (High Performance)")
     
-    if df.empty:
-        st.error("⚠️ Data belum tersedia atau terjadi error koneksi MinIO.")
-        return
-
-    # 2. SIDEBAR FILTER
-    st.sidebar.header("🔍 Filter Dashboard")
-    
-    # Filter Rentang Waktu
-    if 'date_occ' in df.columns and not df['date_occ'].isnull().all():
-        min_date = df['date_occ'].min().date()
-        max_date = df['date_occ'].max().date()
-    else:
-        # Fallback jika kolom tanggal rusak/kosong
-        min_date = pd.to_datetime('2020-01-01').date()
-        max_date = pd.to_datetime('2025-12-31').date()
-    
-    start_date, end_date = st.sidebar.date_input(
-        "Pilih Rentang Tanggal",
-        [min_date, max_date],
-        min_value=min_date,
-        max_value=max_date
-    )
-    
-    # Filter Area (Sekarang aman dari error Sorting)
-    all_areas = sorted(df['area_name'].unique().tolist())
-    selected_areas = st.sidebar.multiselect("Pilih Area", all_areas, default=all_areas[:3])
-    
-    # Terapkan Filter
-    mask = (
-        (df['date_occ'].dt.date >= start_date) & 
-        (df['date_occ'].dt.date <= end_date) &
-        (df['area_name'].isin(selected_areas if selected_areas else all_areas))
-    )
-    filtered_df = df[mask]
-    
-    # 3. HEADER & KPI
-    st.title("🚔 LAPD Crime Intelligence Dashboard")
-    st.markdown("---")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    total_crimes = len(filtered_df)
-    
-    # Handle kolom senjata (cek ketersediaan kolom)
-    if 'weapon_desc' in filtered_df.columns:
-        top_weapon = filtered_df['weapon_desc'].mode()[0] if not filtered_df.empty else "-"
-    else:
-        top_weapon = "-"
-
-    # Handle rata-rata umur
-    if 'vict_age' in filtered_df.columns:
-        avg_age = round(filtered_df['vict_age'].mean(), 1) if not filtered_df.empty else 0
-    else:
-        avg_age = 0
-    
-    col1.metric("Total Kasus", f"{total_crimes:,}")
-    col2.metric("Senjata Terbanyak", str(top_weapon))
-    col3.metric("Rata-rata Umur Korban", f"{avg_age} Thn")
-    col4.metric("Jumlah Area Terpilih", len(filtered_df['area_name'].unique()))
-    
-    st.markdown("---")
-
-    # 4. ROW 1: PETA & TREN WAKTU
-    col_left, col_right = st.columns([1, 2])
-    
-    with col_left:
-        st.subheader("📍 Peta Sebaran (Heatmap)")
-        if not filtered_df.empty and 'lat' in filtered_df.columns and 'lon' in filtered_df.columns:
-            # Hapus koordinat 0 sebelum plotting map
-            map_df = filtered_df[(filtered_df['lat'] != 0) & (filtered_df['lon'] != 0)]
-            if not map_df.empty:
-                fig_map = px.density_mapbox(
-                    map_df, 
-                    lat='lat', 
-                    lon='lon', 
-                    z=None, 
-                    radius=10,
-                    center=dict(lat=34.05, lon=-118.24), 
-                    zoom=9,
-                    mapbox_style="carto-positron"
-                )
-                fig_map.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
-                st.plotly_chart(fig_map, use_container_width=True)
-            else:
-                st.info("Tidak ada data lokasi valid (Lat/Lon bukan 0).")
-        else:
-            st.warning("Kolom Lat/Lon tidak ditemukan.")
-
-    with col_right:
-        st.subheader("📈 Tren Kriminalitas Harian")
-        if not filtered_df.empty:
-            daily_trend = filtered_df.groupby(filtered_df['date_occ'].dt.date).size().reset_index(name='count')
-            fig_trend = px.line(daily_trend, x='date_occ', y='count', markers=True, template="plotly_white")
-            st.plotly_chart(fig_trend, use_container_width=True)
-
-    # 5. ROW 2: DETAIL ANALISIS
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        st.subheader("📊 Top 10 Area Rawan")
-        if not filtered_df.empty:
-            area_counts = filtered_df['area_name'].value_counts().head(10).reset_index()
-            area_counts.columns = ['Area', 'Jumlah']
-            fig_bar = px.bar(area_counts, x='Jumlah', y='Area', orientation='h', color='Jumlah', template="plotly_white")
-            fig_bar.update_layout(yaxis={'categoryorder':'total ascending'})
-            st.plotly_chart(fig_bar, use_container_width=True)
+    # 1. LOAD DATA TERPISAH (Ringan di awal)
+    with st.spinner("Memuat Data Warehouse..."):
+        fact_df = load_fact_table()
         
-    with col_b:
-        st.subheader("⚠️ Jenis Kejahatan Terbanyak")
-        # Cek kolom deskripsi kejahatan (crm_cd_desc atau crm_cd)
-        cat_col = 'crm_cd_desc' if 'crm_cd_desc' in df.columns else 'crm_cd'
-        
-        if not filtered_df.empty and cat_col in filtered_df.columns:
-            crime_types = filtered_df[cat_col].value_counts().head(10).reset_index()
-            crime_types.columns = ['Jenis', 'Jumlah']
-            fig_pie = px.pie(crime_types, values='Jumlah', names='Jenis', hole=0.4)
-            st.plotly_chart(fig_pie, use_container_width=True)
+        # Load Dimensi secara paralel (konsepnya)
+        dims = {
+            "dim_area": load_dim_table("dim_area.csv"),
+            "dim_crime": load_dim_table("dim_crime.csv"),
+            "dim_status": load_dim_table("dim_status.csv"),
+            "dim_weapon": load_dim_table("dim_weapon.csv"),
+            "dim_premis": load_dim_table("dim_premis.csv")
+        }
 
-    # 6. RAW DATA TABLE
-    with st.expander("📂 Lihat Data Mentah"):
-        st.dataframe(filtered_df.sort_values(by='date_occ', ascending=False).head(1000))
+    if fact_df.empty:
+        st.error("Data Fact kosong. Cek Pipeline Airflow.")
+        st.stop()
+
+    # 2. FILTERING (Dilakukan pada Fact Table SAJA sebelum Join)
+    st.sidebar.header("🔍 Filter Cepat")
+    
+    # Filter Tanggal
+    min_date = fact_df['date_occ'].min().date()
+    max_date = fact_df['date_occ'].max().date()
+    start_date, end_date = st.sidebar.date_input("Rentang Waktu", [min_date, max_date])
+    
+    # Optimasi: Filter Fact Table DULUAN
+    # Ini membuang jutaan baris yang tidak perlu ditampilkan
+    filtered_fact = fact_df[
+        (fact_df['date_occ'].dt.date >= start_date) & 
+        (fact_df['date_occ'].dt.date <= end_date)
+    ]
+    
+    # Filter Area (Optional - butuh join dulu kalau mau filter by nama area)
+    # Trik: Kita filter by ID kalau user pilih nama, biar hemat memori join
+    area_dim = dims["dim_area"]
+    if not area_dim.empty:
+        area_names = sorted(area_dim['area_name'].dropna().unique())
+        selected_areas = st.sidebar.multiselect("Pilih Wilayah", area_names)
+        
+        if selected_areas:
+            # Ambil ID dari area yang dipilih
+            selected_ids = area_dim[area_dim['area_name'].isin(selected_areas)]['area_id'].tolist()
+            filtered_fact = filtered_fact[filtered_fact['area_id'].isin(selected_ids)]
+
+    # 3. JOINING (Hanya pada data yang sudah disaring)
+    # Misal: Dari 1 juta baris, setelah filter tanggal cuma sisa 5000 baris.
+    # Join 5000 baris itu SANGAT CEPAT dan MEMORI KECIL.
+    final_df = join_with_dims(filtered_fact, dims)
+    
+    # Garbage Collection manual untuk membuang sampah memori
+    gc.collect()
+
+    # 4. KPI CARDS
+    st.markdown("---")
+    c1, c2, c3, c4 = st.columns(4)
+    
+    c1.metric("Total Kasus", f"{len(final_df):,}")
+    
+    top_crime = final_df['crm_cd_desc'].mode()[0] if 'crm_cd_desc' in final_df.columns and not final_df.empty else "-"
+    c2.metric("Kejahatan Terbanyak", str(top_crime)[:20] + "...") # Truncate biar ga ngerusak UI
+    
+    top_weapon = final_df['weapon_desc'].mode()[0] if 'weapon_desc' in final_df.columns and not final_df.empty else "-"
+    c3.metric("Senjata Dominan", str(top_weapon)[:20] + "...")
+    
+    avg_age = round(final_df['vict_age'].mean(), 1) if not final_df.empty else 0
+    c4.metric("Rata-rata Umur", f"{avg_age} Thn")
+
+    st.markdown("---")
+
+    # 5. VISUALISASI
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("📈 Tren Kriminalitas")
+        if not final_df.empty:
+            # Grouping data kecil (sudah difilter) -> Cepat
+            daily = final_df.groupby(final_df['date_occ'].dt.date).size().reset_index(name='Jumlah')
+            fig = px.line(daily, x='date_occ', y='Jumlah', template="plotly_white")
+            st.plotly_chart(fig, use_container_width=True)
+            
+    with col2:
+        st.subheader("📊 Status Kasus")
+        if 'status_desc' in final_df.columns and not final_df.empty:
+            status_counts = final_df['status_desc'].value_counts().reset_index()
+            status_counts.columns = ['Status', 'Jumlah']
+            fig = px.pie(status_counts, values='Jumlah', names='Status', hole=0.4)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # 6. PETA (Hanya tampilkan max 1000 titik agar browser tidak crash)
+    st.subheader(f"🗺️ Peta Sebaran (Sampel 1000 Titik dari {len(final_df)} data)")
+    if not final_df.empty:
+        map_data = final_df[(final_df['lat'] != 0) & (final_df['lon'] != 0)]
+        if len(map_data) > 1000:
+            map_data = map_data.sample(1000)
+            
+        if not map_data.empty:
+            fig_map = px.scatter_mapbox(
+                map_data, lat="lat", lon="lon",
+                color="area_name" if "area_name" in map_data.columns else None,
+                zoom=9, center=dict(lat=34.05, lon=-118.24),
+                mapbox_style="carto-positron"
+            )
+            st.plotly_chart(fig_map, use_container_width=True)
 
 if __name__ == "__main__":
     main()
